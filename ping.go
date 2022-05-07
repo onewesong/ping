@@ -2,165 +2,218 @@ package ping
 
 import (
 	"bytes"
-	"errors"
+	"log"
+	"math"
 	"net"
 	"os"
+	"sync"
 	"time"
 )
 
-const (
-	icmpv4EchoRequest = 8
-	icmpv4EchoReply   = 0
-	icmpv6EchoRequest = 128
-	icmpv6EchoReply   = 129
-)
+type Pinger struct {
+	laddr *net.IPAddr
+	raddr *net.IPAddr
 
-type icmpMessage struct {
-	Type     int             // type
-	Code     int             // code
-	Checksum int             // checksum
-	Body     icmpMessageBody // body
+	// Count tells pinger to stop after sending (and receiving) Count echo
+	// packets. If this option is not specified, pinger will operate until
+	// interrupted.
+	Count int
+
+	// Interval is the wait time between each packet send. Default is 1s.
+	Interval time.Duration
+
+	// Timeout specifies a timeout before ping exits, regardless of how many
+	// packets have been received.
+	Timeout time.Duration
+
+	// Verbose output each ping detail.
+	Verbose bool
+
+	// Number of packets sent
+	PacketsSent int
+
+	// Number of packets received
+	PacketsRecv int
+
+	// Number of duplicate packets received
+	PacketsRecvDuplicates int
+
+	// Round trip time statistics
+	minRtt    time.Duration
+	maxRtt    time.Duration
+	avgRtt    time.Duration
+	stdDevRtt time.Duration
+	stddevm2  time.Duration
+	statsMu   sync.RWMutex
+
+	// rtts is all of the Rtts
+	rtts []time.Duration
+
+	// is finished
+	finished bool
+
+	// OnSetup is called when Pinger has finished setting up the listening socket
+	OnSetup func()
+
+	// OnSend is called when Pinger sends a packet
+	OnSend func(*Packet)
+
+	// OnLost is called when Pinger lost a packet
+	OnLost func(*Packet)
+
+	// OnRecv is called when Pinger receives and processes a packet
+	OnRecv func(*Packet)
+
+	// OnFinish is called when Pinger exits
+	OnFinish func(*Statistics)
 }
 
-type icmpMessageBody interface {
-	Len() int
-	Marshal() ([]byte, error)
-}
+func (p *Pinger) updateStatistics(pkt *Packet) {
+	p.statsMu.Lock()
+	defer p.statsMu.Unlock()
 
-// Marshal returns the binary enconding of the ICMP echo request or
-// reply message m.
-func (m *icmpMessage) Marshal() ([]byte, error) {
-	b := []byte{byte(m.Type), byte(m.Code), 0, 0}
-	if m.Body != nil && m.Body.Len() != 0 {
-		mb, err := m.Body.Marshal()
-		if err != nil {
-			return nil, err
-		}
-		b = append(b, mb...)
+	p.PacketsRecv++
+	p.rtts = append(p.rtts, pkt.Rtt)
+
+	if p.PacketsRecv == 1 || pkt.Rtt < p.minRtt {
+		p.minRtt = pkt.Rtt
 	}
-	switch m.Type {
-	case icmpv6EchoRequest, icmpv6EchoReply:
-		return b, nil
+
+	if pkt.Rtt > p.maxRtt {
+		p.maxRtt = pkt.Rtt
 	}
-	csumcv := len(b) - 1 // checksum coverage
-	s := uint32(0)
-	for i := 0; i < csumcv; i += 2 {
-		s += uint32(b[i+1])<<8 | uint32(b[i])
-	}
-	if csumcv&1 == 0 {
-		s += uint32(b[csumcv])
-	}
-	s = s>>16 + s&0xffff
-	s = s + s>>16
-	// Place checksum back in header; using ^= avoids the
-	// assumption the checksum bytes are zero.
-	b[2] ^= byte(^s & 0xff)
-	b[3] ^= byte(^s >> 8)
-	return b, nil
+
+	pktCount := time.Duration(p.PacketsRecv)
+	// welford's online method for stddev
+	// https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
+	delta := pkt.Rtt - p.avgRtt
+	p.avgRtt += delta / pktCount
+	delta2 := pkt.Rtt - p.avgRtt
+	p.stddevm2 += delta * delta2
+
+	p.stdDevRtt = time.Duration(math.Sqrt(float64(p.stddevm2 / pktCount)))
 }
 
-// parseICMPMessage parses b as an ICMP message.
-func parseICMPMessage(b []byte) (*icmpMessage, error) {
-	msglen := len(b)
-	if msglen < 4 {
-		return nil, errors.New("message too short")
+func (p *Pinger) Statistics() *Statistics {
+	p.statsMu.RLock()
+	defer p.statsMu.RUnlock()
+	sent := p.PacketsSent
+	loss := float64(sent-p.PacketsRecv) / float64(sent) * 100
+	s := Statistics{
+		PacketsSent:           sent,
+		PacketsRecv:           p.PacketsRecv,
+		PacketsRecvDuplicates: p.PacketsRecvDuplicates,
+		PacketLoss:            loss,
+		Rtts:                  p.rtts,
+		LocalIP:               p.laddr.String(),
+		RemoteIP:              p.raddr.String(),
+		MaxRtt:                p.maxRtt,
+		MinRtt:                p.minRtt,
+		AvgRtt:                p.avgRtt,
+		StdDevRtt:             p.stdDevRtt,
 	}
-	m := &icmpMessage{Type: int(b[0]), Code: int(b[1]), Checksum: int(b[2])<<8 | int(b[3])}
-	if msglen > 4 {
-		var err error
-		switch m.Type {
-		case icmpv4EchoRequest, icmpv4EchoReply, icmpv6EchoRequest, icmpv6EchoReply:
-			m.Body, err = parseICMPEcho(b[4:])
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-	return m, nil
+	return &s
 }
 
-// imcpEcho represenets an ICMP echo request or reply message body.
-type icmpEcho struct {
-	ID   int    // identifier
-	Seq  int    // sequence number
-	Data []byte // data
-}
-
-func (p *icmpEcho) Len() int {
-	if p == nil {
-		return 0
-	}
-	return 4 + len(p.Data)
-}
-
-// Marshal returns the binary enconding of the ICMP echo request or
-// reply message body p.
-func (p *icmpEcho) Marshal() ([]byte, error) {
-	b := make([]byte, 4+len(p.Data))
-	b[0], b[1] = byte(p.ID>>8), byte(p.ID&0xff)
-	b[2], b[3] = byte(p.Seq>>8), byte(p.Seq&0xff)
-	copy(b[4:], p.Data)
-	return b, nil
-}
-
-// parseICMPEcho parses b as an ICMP echo request or reply message body.
-func parseICMPEcho(b []byte) (*icmpEcho, error) {
-	bodylen := len(b)
-	p := &icmpEcho{ID: int(b[0])<<8 | int(b[1]), Seq: int(b[2])<<8 | int(b[3])}
-	if bodylen > 4 {
-		p.Data = make([]byte, bodylen-4)
-		copy(p.Data, b[4:])
-	}
-	return p, nil
-}
-
-func Ping(localIP, remoteIP string, timeout int) bool {
-	err := Pinger(localIP, remoteIP, timeout)
-	return err == nil
-}
-
-func Pinger(localIP, remoteIP string, timeout int) error {
+func NewPinger(localIP, remoteIP string, timeout time.Duration, count int) *Pinger {
 	laddr := net.IPAddr{IP: net.ParseIP(localIP)}
 	raddr := net.IPAddr{IP: net.ParseIP(remoteIP)}
-	c, err := net.DialIP("ip4:icmp", &laddr, &raddr)
-	if err != nil {
-		return err
+	return &Pinger{
+		Interval: 1 * time.Second,
+
+		laddr:   &laddr,
+		raddr:   &raddr,
+		Timeout: timeout,
+		Count:   count,
 	}
-	c.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+}
+
+func (p *Pinger) Run() {
+	if p.finished {
+		return
+	}
+	defer p.Finish()
+	ping := func(seq int) {
+		var isLost = false
+		err, packet := p.Ping(seq)
+		if err != nil {
+			isLost = true
+			handler := p.OnLost
+			if handler != nil {
+				handler(&packet)
+			}
+		} else {
+			handler := p.OnRecv
+			if handler != nil {
+				handler(&packet)
+			}
+			p.updateStatistics(&packet)
+		}
+		if p.Verbose {
+			if isLost {
+				log.Printf("lost seq=%d timeout=%ds", p.PacketsSent, p.Timeout.Milliseconds())
+			} else {
+				log.Printf("pong seq=%d time=%dms ttl=%v size=%dbyte", p.PacketsSent, packet.Rtt.Milliseconds(), packet.TTL, packet.Nbytes)
+			}
+		}
+		p.PacketsSent++
+	}
+	for count := p.Count; count != 0; {
+		if count > 0 {
+			count--
+		}
+		ping(p.PacketsSent)
+		time.Sleep(p.Interval)
+	}
+	return
+}
+
+func (p *Pinger) Ping(seq int) (err error, packet Packet) {
+	packet.Seq = seq
+	start := time.Now()
+	c, err := net.DialIP("ip4:icmp", p.laddr, p.raddr)
+	if err != nil {
+		return
+	}
+	c.SetDeadline(time.Now().Add(p.Timeout))
 	defer c.Close()
 
 	typ := icmpv4EchoRequest
 	xid, xseq := os.Getpid()&0xffff, 1
 	wb, err := (&icmpMessage{
-		Type: typ, Code: 0,
+		Type: typ, Code: 0, SequenceNum: seq & 0xffff,
 		Body: &icmpEcho{
 			ID: xid, Seq: xseq,
-			Data: bytes.Repeat([]byte("Go Go Gadget Ping!!!"), 3),
+			Data: bytes.Repeat([]byte("Ping"), 3),
 		},
 	}).Marshal()
 	if err != nil {
-		return err
+		return
 	}
 	if _, err = c.Write(wb); err != nil {
-		return err
+		return
 	}
 	var m *icmpMessage
 	rb := make([]byte, 20+len(wb))
 	for {
 		if _, err = c.Read(rb); err != nil {
-			return err
+			return
 		}
+		packet.TTL = int(rb[8])
 		rb = ipv4Payload(rb)
+		packet.Nbytes = len(rb)
 		if m, err = parseICMPMessage(rb); err != nil {
-			return err
+			return
 		}
 		switch m.Type {
 		case icmpv4EchoRequest, icmpv6EchoRequest:
 			continue
 		}
+		packet.Rtt = time.Since(start)
 		break
 	}
-	return nil
+
+	return
 }
 
 func ipv4Payload(b []byte) []byte {
@@ -169,4 +222,17 @@ func ipv4Payload(b []byte) []byte {
 	}
 	hdrlen := int(b[0]&0x0f) << 2
 	return b[hdrlen:]
+}
+
+var finishOnce sync.Once
+
+func (p *Pinger) Finish() {
+	finishOnce.Do(func() {
+		p.finished = true
+		handler := p.OnFinish
+		if handler != nil {
+			s := p.Statistics()
+			handler(s)
+		}
+	})
 }
